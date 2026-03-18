@@ -408,5 +408,30 @@ class TestIntegration:
         env.close()
 
 
+    def test_real_torax_backend(self):
+        """Optional smoke test for the real TORAX backend."""
+        pytest.importorskip("torax")
+
+        config = ToraxEnvironmentConfig(
+            use_torax=True,
+            use_qlknn=False,
+            use_mock_fallback=False,
+            fixed_dt=0.05,
+            max_dt=0.05,
+            episode_max_steps=2,
+            n_rho=12,
+        )
+        env = ToraxRLEnvironment(config)
+        obs, info = env.reset(seed=0)
+        assert info["backend"] == "torax"
+        assert obs.shape == (11,)
+
+        obs, reward, terminated, truncated, info = env.step(np.array([0.4, 0.0], dtype=np.float32))
+        assert info["backend"] == "torax"
+        assert np.isfinite(obs).all()
+        assert 0.0 <= reward <= 1.0
+        env.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

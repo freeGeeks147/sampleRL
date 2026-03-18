@@ -56,6 +56,21 @@ history = trainer.train(num_iterations=10, steps_per_iteration=2048)
 trainer.save("my_policy.pt")
 ```
 
+### Recommended paper-like baseline
+
+The default `paper_baseline.py` path now uses the **real TORAX backend** and
+QLKNN transport model, with a short control horizon so you can actually run a
+serious-physics smoke test locally.
+
+```bash
+python paper_baseline.py
+```
+
+For faster debugging, call `build_paper_like_trainer(real_physics=False)` to
+use the mock backend. Artifacts are written to `artifacts/paper_baseline/` and
+include the trained checkpoint, config, training history, and evaluation
+metrics.
+
 ## Detailed Usage
 
 ### 1. Run Examples

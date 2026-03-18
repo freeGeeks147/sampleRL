@@ -381,6 +381,52 @@ def check_physics():
     return all(checks)
 
 
+
+def check_real_torax_backend(torax_available: bool):
+    """Verify that the real TORAX backend can reset and step."""
+    print_header("7. REAL TORAX BACKEND")
+
+    if not torax_available:
+        logger.warning("⚠ TORAX package unavailable; skipping real-backend validation")
+        return True
+
+    from torax_rl_env import ToraxEnvironmentConfig, ToraxRLEnvironment
+
+    checks = []
+
+    try:
+        config = ToraxEnvironmentConfig(
+            use_torax=True,
+            use_qlknn=False,
+            use_mock_fallback=False,
+            fixed_dt=0.05,
+            max_dt=0.05,
+            episode_max_steps=2,
+            n_rho=12,
+        )
+        env = ToraxRLEnvironment(config)
+        obs, info = env.reset(seed=0)
+        assert info["backend"] == "torax"
+        assert obs.shape == (11,)
+        logger.info("✓ TORAX reset succeeded")
+        checks.append(True)
+
+        obs, reward, terminated, truncated, info = env.step(np.array([0.4, 0.0], dtype=np.float32))
+        assert info["backend"] == "torax"
+        assert np.isfinite(obs).all()
+        assert 0.0 <= reward <= 1.0
+        logger.info("✓ TORAX step succeeded: q95=%.2f, beta_N=%.2f, reward=%.3f", obs[4], obs[5], reward)
+        checks.append(True)
+
+        env.close()
+    except Exception as e:
+        logger.error(f"✗ Real TORAX backend check failed: {e}")
+        import traceback
+        traceback.print_exc()
+        checks.append(False)
+
+    return all(checks)
+
 def main():
     """Run all validation checks."""
     print("\n")
@@ -401,11 +447,12 @@ def main():
     train_ok = check_ppo_trainer()
     ckpt_ok = check_checkpointing()
     phys_ok = check_physics()
+    real_torax_ok = check_real_torax_backend(torax_avail)
     
     # Summary
     print_header("VALIDATION SUMMARY")
     
-    all_passed = all([env_ok, net_ok, train_ok, ckpt_ok, phys_ok])
+    all_passed = all([env_ok, net_ok, train_ok, ckpt_ok, phys_ok, real_torax_ok])
     
     checks = [
         ("Imports", imports_ok),
@@ -414,6 +461,7 @@ def main():
         ("Trainer", train_ok),
         ("Checkpointing", ckpt_ok),
         ("Physics", phys_ok),
+        ("Real TORAX", real_torax_ok),
     ]
     
     for check_name, passed in checks:
