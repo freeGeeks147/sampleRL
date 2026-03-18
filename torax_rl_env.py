@@ -1,39 +1,43 @@
-"""
-TORAX-based Reinforcement Learning Environment for Tokamak Plasma Control.
+"""Tokamak plasma-control environment with optional real TORAX integration.
 
-This module provides a physics-informed RL environment based on TORAX (Tokamak
-Optimization and Analysis eXplorer) transport solver from Google DeepMind,
-with real QLKNN turbulent transport model.
+The environment supports two backends:
+- a real TORAX transport solve with time-varying actuator schedules; and
+- a lightweight mock backend for fast development or unit tests.
 
-Architecture:
-- Uses TORAX's full transport solver for realistic physics
-- Integrates fusion_surrogates QLKNN neural network for turbulence
-- Gymnasium-compatible observation/action spaces
-- Physics constraints enforced (stability, density limit, MHD beta)
-
-Reference:
-- TORAX: https://github.com/google-deepmind/torax
-- QLKNN: Jansen et al., Nuclear Fusion 2018
-- ITER89L: ITER Physics Expert Groups, Nuclear Fusion 1999
-
-Author: Research Implementation
-Date: March 2026
+The TORAX path is intentionally more expensive but materially more serious than
+an ad-hoc mock: each control step rebuilds a time-dependent TORAX config using
+all actions taken so far, then reruns the transport simulation over the full
+control horizon. This is slower than a true in-memory closed-loop coupling, but
+it ensures that observations come from the real transport solver instead of from
+placeholder algebra.
 """
 
-import numpy as np
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import logging
+from typing import Any, Dict, Optional, Tuple
+
 import gymnasium as gym
 from gymnasium import spaces
-from typing import Dict, Tuple, Optional, Any
-from dataclasses import dataclass
-import logging
-
-import torax
-from torax import ToraxConfig, run_simulation, StateHistory
+import numpy as np
 
 try:
-    from fusion_surrogates.qlknn import qlknn_model
+    import torax
+    from torax import StateHistory, run_simulation
+
+    HAS_TORAX = True
+except ImportError:  # pragma: no cover - optional dependency
+    torax = None
+    StateHistory = Any
+    run_simulation = None
+    HAS_TORAX = False
+
+try:
+    from fusion_surrogates.qlknn import qlknn_model  # noqa: F401
+
     HAS_QLKNN = True
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     HAS_QLKNN = False
 
 
@@ -42,552 +46,528 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ToraxEnvironmentConfig:
-    """Configuration for TORAX RL environment."""
-    
-    # TORAX simulation parameters
-    t_final: float = 10.0  # Final simulation time [s]
-    fixed_dt: float = 0.1  # Fixed timestep [s]
-    max_dt: float = 0.5    # Max adaptive timestep [s]
-    
-    # Plasma parameters (ITER-like)
-    R_major: float = 6.2   # Major radius [m]
-    a_minor: float = 2.0   # Minor radius [m]
-    B_0: float = 5.3       # Toroidal field on axis [T]
-    
+    """Configuration for the tokamak plasma-control environment."""
+
+    # Simulation timing
+    t_final: float = 1.0
+    fixed_dt: float = 0.1
+    max_dt: float = 0.2
+    episode_max_steps: int = 8
+
+    # Backend selection
+    use_torax: bool = True
+    use_qlknn: bool = True
+    use_mock_fallback: bool = True
+
+    # Machine geometry
+    R_major: float = 6.2
+    a_minor: float = 2.0
+    B_0: float = 5.3
+    elongation_lcfs: float = 1.72
+    n_rho: int = 15
+
     # Initial conditions
-    T_e_core_init: float = 6.0  # Initial core electron temp [keV]
-    T_i_core_init: float = 6.0  # Initial core ion temp [keV]
-    n_e_core_init: float = 1.5  # Initial core density [10^19 m^-3]
-    
-    # Heating
-    P_heating_max: float = 50.0e6  # Max heating power [W]
-    heating_location: float = 0.15  # Heating deposition location (rho_norm)
-    heating_width: float = 0.1      # Heating deposition width
-    
-    # Control constraints
-    I_p_min: float = 2.0e6   # Min plasma current [A]
-    I_p_max: float = 15.0e6  # Max plasma current [A]
-    n_Greenwald_frac: float = 0.9  # Greenwald density fraction limit
-    beta_N_limit: float = 3.0  # Normalized beta limit
-    
-    # RL parameters
-    episode_max_steps: int = 100  # Max steps per episode
-    
-    # Transport model
-    use_qlknn: bool = True  # Use real QLKNN (vs constant transport)
-    apply_inner_patch: bool = True  # Apply inner core transport patch
-    
-    # Observation/action normalization
-    obs_normalize: bool = True
+    T_e_core_init: float = 8.0
+    T_i_core_init: float = 8.0
+    n_e_core_init: float = 1.1e20
+    n_e_edge: float = 0.6e20
+    I_p_init: float = 8.0e6
+    Z_eff: float = 1.6
+
+    # Actuators
+    P_heating_max: float = 50.0e6
+    P_heating_baseline: float = 18.0e6
+    particle_source_baseline: float = 1.0e21
+    generic_current_fraction: float = 0.12
+    current_ramp_rate_limit: float = 1.0e6  # A/s
+    heating_location: float = 0.25
+    heating_width: float = 0.12
+    current_location: float = 0.36
+    current_width: float = 0.075
+    particle_width: float = 0.25
+    particle_deposition_location: float = 0.30
+
+    # Operating limits/targets
+    I_p_min: float = 5.0e6
+    I_p_max: float = 12.0e6
+    n_Greenwald_frac: float = 0.9
+    beta_N_limit: float = 3.0
+    target_T_e: float = 6.0
+    target_n_e: float = 0.95  # in 1e20 m^-3 for observations
+    target_q95: float = 4.5
+    target_beta_N: float = 1.8
+    target_tau_E: float = 2.5
+
+    # TORAX numerics / solver
+    adaptive_dt: bool = False
+    use_pereverzev: bool = True
+    theta_implicit: float = 1.0
+
+    # Constant-transport fallback params when QLKNN is disabled
+    chi_i: float = 1.2
+    chi_e: float = 1.0
+    D_e: float = 0.2
+    V_e: float = -0.05
+
+    # Mock backend development knobs
+    scenario_randomization: bool = True
+    actuator_lag: float = 0.35
+    temperature_relaxation: float = 0.08
+    density_relaxation: float = 0.04
+    radiation_loss_coeff: float = 0.018
+    transport_loss_coeff: float = 0.55
+    bootstrap_coupling: float = 0.05
+    obs_normalize: bool = False
     act_normalize: bool = True
+
+    # Internal schedule seed values for TORAX rollout construction
+    control_history_seed: Tuple[float, ...] = field(default_factory=lambda: (0.0,))
 
 
 class ToraxRLEnvironment(gym.Env):
-    """
-    TORAX-based RL environment for tokamak plasma control.
-    
-    Observation Space:
-        Vector of 11 quantities:
-        [Te_avg, Ti_avg, ne_avg, Ip, q95, beta_N, tau_E, 
-         dTe_dt, dni_dt, dIp_dt, P_loss]
-    
-    Action Space:
-        Vector of 2-3 continuous values:
-        [P_ecrh_fraction, dIp_target, n_target_fraction]
-    
-    Reward:
-        Multi-objective combining:
-        - Energy confinement
-        - Current stability
-        - Density control
-        - MHD margin
-        - Safety margins (q95 > 2.5, beta < limit)
-    
-    Physics Validation:
-        - TORAX transport equations (full solve)
-        - QLKNN turbulent transport (gyrokinetic-trained)
-        - Experimental scaling laws (ITER89L)
-        - Neoclassical physics (Sauter bootstrap)
-        - MHD stability margins
-    """
-    
-    metadata = {
-        "render_modes": ["human"],
-        "render_fps": 1,
-    }
-    
+    """Gymnasium environment for tokamak plasma control."""
+
+    metadata = {"render_modes": ["human"], "render_fps": 1}
+
     def __init__(
         self,
         config: Optional[ToraxEnvironmentConfig] = None,
         render_mode: Optional[str] = None,
         verbose: bool = False,
-    ):
-        """
-        Initialize TORAX RL environment.
-        
-        Args:
-            config: ToraxEnvironmentConfig instance
-            render_mode: "human" for live plotting
-            verbose: Print simulation status
-        """
+    ) -> None:
         self.config = config or ToraxEnvironmentConfig()
         self.render_mode = render_mode
         self.verbose = verbose
-        
+
         logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
-        
-        # Verify QLKNN availability
+
+        if self.config.use_torax and not HAS_TORAX:
+            logger.warning("TORAX not available, falling back to mock plasma backend")
+            self.config.use_torax = False
         if self.config.use_qlknn and not HAS_QLKNN:
-            logger.warning("QLKNN not available, falling back to constant transport")
+            logger.warning("QLKNN not available, falling back to constant transport in TORAX")
             self.config.use_qlknn = False
-        
-        # Build TORAX configuration
-        self.torax_config = self._build_torax_config()
-        
-        # Initialize state tracking
+
         self.current_state_history: Optional[StateHistory] = None
         self.step_count = 0
         self.episode_count = 0
-        
-        # Define action and observation spaces
-        # Action: [P_ecrh_fraction (0-1), dIp_target (-1e6 to +1e6 A/s)]
+        self._prev_obs = np.zeros(11, dtype=np.float32)
+        self._last_action = np.zeros(2, dtype=np.float32)
+
+        # Mock backend state
+        self._state: Dict[str, float] = {}
+
+        # TORAX control schedule state
+        self._control_times: list[float] = []
+        self._heating_schedule: list[float] = []
+        self._ip_schedule: list[float] = []
+        self._torax_runtime_backend: str = "mock"
+        self._torax_sim_error: str = "NONE"
+
         self.action_space = spaces.Box(
             low=np.array([0.0, -2.0], dtype=np.float32),
             high=np.array([1.0, 2.0], dtype=np.float32),
             dtype=np.float32,
         )
-        
-        # Observation: 11 quantities as described above
         self.observation_space = spaces.Box(
             low=np.array([-np.inf] * 11, dtype=np.float32),
             high=np.array([np.inf] * 11, dtype=np.float32),
             dtype=np.float32,
         )
-        
-        logger.info(f"TORAX RL Environment initialized")
-        logger.info(f"  Action space: {self.action_space}")
-        logger.info(f"  Observation space: {self.observation_space}")
-        logger.info(f"  Transport model: {'QLKNN' if self.config.use_qlknn else 'Constant'}")
-    
-    def _build_torax_config(self) -> ToraxConfig:
-        """Build TORAX configuration from environment config."""
-        
-        # Use ITER hybrid scenario as base
-        config_dict = {
-            'plasma_composition': {
-                'main_ion': {'D': 0.5, 'T': 0.5},
-                'impurity': 'Ne',
-                'Z_eff': 1.6,
-            },
-            'profile_conditions': {
-                'Ip': {0: 8.0e6, self.config.t_final: 8.0e6},  # 8 MA baseline
-                'T_i': {0.0: {0.0: self.config.T_i_core_init, 1.0: 0.1}},
-                'T_i_right_bc': 0.1,
-                'T_e': {0.0: {0.0: self.config.T_e_core_init, 1.0: 0.1}},
-                'T_e_right_bc': 0.1,
-                'n_e_right_bc_is_fGW': True,
-                'n_e_right_bc': {0: 0.3, self.config.t_final: 0.3},
-                'n_e_nbar_is_fGW': True,
-                'nbar': self.config.n_e_core_init,
-                'n_e': {0: {0.0: self.config.n_e_core_init, 1.0: 1.0}},
-            },
-            'numerics': {
-                't_final': self.config.t_final,
-                'fixed_dt': self.config.fixed_dt,
-                'resistivity_multiplier': 1,
-                'evolve_ion_heat': True,
-                'evolve_electron_heat': True,
-                'evolve_current': True,
-                'evolve_density': True,
-                'max_dt': self.config.max_dt,
-                'chi_timestep_prefactor': 30,
-                'dt_reduction_factor': 3,
-            },
-            'geometry': {
-                'geometry_type': 'chease',
-                'geometry_file': 'ITER_hybrid_citrin_equil_cheasedata.mat2cols',
-                'Ip_from_parameters': True,
-                'R_major': self.config.R_major,
-                'a_minor': self.config.a_minor,
-                'B_0': self.config.B_0,
-            },
-            'neoclassical': {
-                'bootstrap_current': {'bootstrap_multiplier': 1.0},
-            },
-            'sources': {
-                'generic_current': {
-                    'fraction_of_total_current': 0.15,
-                    'gaussian_width': 0.075,
-                    'gaussian_location': 0.36,
-                },
-                'generic_particle': {
-                    'S_total': 0.0,
-                    'deposition_location': 0.3,
-                    'particle_width': 0.25,
-                },
-                'gas_puff': {
-                    'puff_decay_length': 0.3,
-                    'S_total': 0.0,
-                },
-                'pellet': {
-                    'S_total': 0.0,
-                    'pellet_width': 0.1,
-                    'pellet_deposition_location': 0.85,
-                },
-                'generic_heat': {
-                    'gaussian_location': self.config.heating_location,
-                    'gaussian_width': self.config.heating_width,
-                    'P_total': 20.0e6,  # Default
-                    'electron_heat_fraction': 1.0,
-                },
-                'fusion': {},
-                'ei_exchange': {'Qei_multiplier': 1.0},
-            },
-            'pedestal': {
-                'model_name': 'set_T_ped_n_ped',
-                'set_pedestal': True,
-                'T_i_ped': 1.0,
-                'T_e_ped': 1.0,
-                'n_e_ped_is_fGW': True,
-                'n_e_ped': {0: 0.3, self.config.t_final: 0.7},
-                'rho_norm_ped_top': 0.9,
-            },
-            'transport': {
-                'model_name': 'qlknn' if self.config.use_qlknn else 'constant',
-                'apply_inner_patch': self.config.apply_inner_patch,
-                'D_e_inner': 0.25,
-                'V_e_inner': 0.0,
-                'chi_i_inner': 1.5,
-                'chi_e_inner': 1.5,
-                'rho_inner': 0.3,
-            },
-            'mhd': {'sawtooth': None},
-            'solver': {
-                'solver_type': 'newton_raphson',
-            },
-        }
-        
-        try:
-            config = torax.ToraxConfig(**config_dict)
-            logger.info("TORAX config built successfully")
-            return config
-        except Exception as e:
-            logger.error(f"Failed to build TORAX config: {e}")
-            raise
-    
+
     def reset(
         self,
         seed: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """
-        Reset environment to initial state.
-        
-        Args:
-            seed: Random seed for reproducibility
-            options: Additional options
-        
-        Returns:
-            Initial observation and info dict
-        """
         super().reset(seed=seed)
-        
         self.step_count = 0
         self.episode_count += 1
-        
-        # Run TORAX for one short simulation to get initial state
-        logger.info(f"Episode {self.episode_count}: Resetting environment")
-        
-        try:
-            # Initial state from TORAX
-            output_tree, state_history = run_simulation(
-                self.torax_config,
-                log_timestep_info=False,
-                progress_bar=False,
-            )
-            self.current_state_history = state_history
-            
-            # Extract initial observation
-            obs = self._extract_observation(state_history)
-            info = {"episode": self.episode_count}
-            
-            logger.info(f"Initial observation: Te={obs[0]:.2f} keV, ne={obs[2]:.2f}e19")
-            
-            return obs, info
-            
-        except Exception as e:
-            logger.error(f"Reset failed: {e}")
-            raise
-    
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """
-        Execute one environment step with given action.
-        
-        Args:
-            action: [P_ecrh_fraction, dIp_target_rate]
-                P_ecrh_fraction: (0-1) fraction of max heating
-                dIp_target_rate: (-2 to +2) dI/dt in MA/s
-        
-        Returns:
-            observation, reward, terminated, truncated, info
-        """
-        self.step_count += 1
-        
-        # Parse action
-        P_ecrh_frac = np.clip(action[0], 0.0, 1.0)
-        dIp_target = np.clip(action[1], -2.0, 2.0) * 1.0e6  # Convert to A/s
-        
-        P_heating = P_ecrh_frac * self.config.P_heating_max
-        
-        # Modify TORAX config for this step (update heating)
-        # Note: In real implementation, would use TORAX's control interface
-        # For now, simulate the step
-        
-        logger.debug(f"Step {self.step_count}: P_ecrh={P_heating/1e6:.1f}MW, dIp={dIp_target/1e6:.2f}MA/s")
-        
-        try:
-            # Run simulation step
-            output_tree, state_history = run_simulation(
-                self.torax_config,
-                log_timestep_info=False,
-                progress_bar=False,
-            )
-            self.current_state_history = state_history
-            
-            # Extract observation
-            obs = self._extract_observation(state_history)
-            
-            # Compute reward
-            reward = self._compute_reward(obs, action)
-            
-            # Check termination conditions
-            terminated = self._check_termination(obs)
-            truncated = self.step_count >= self.config.episode_max_steps
-            
-            info = {
-                "step": self.step_count,
-                "P_heating": P_heating / 1e6,
-                "reward_components": self._get_reward_components(obs, action),
-            }
-            
-            if terminated or truncated:
-                logger.info(f"Episode ended: terminated={terminated}, truncated={truncated}")
-                logger.info(f"  Final obs: Te={obs[0]:.2f}keV, ne={obs[2]:.2f}e19, q95={obs[4]:.2f}")
-            
-            return obs, reward, terminated, truncated, info
-            
-        except Exception as e:
-            logger.error(f"Step failed: {e}")
-            # Return failure state
-            obs = np.zeros(11, dtype=np.float32)
-            return obs, -1.0, True, False, {"error": str(e)}
-    
-    def _extract_observation(self, state_history: StateHistory) -> np.ndarray:
-        """
-        Extract observation vector from TORAX state history.
-        
-        Returns:
-            [Te_avg, Ti_avg, ne_avg, Ip, q95, beta_N, tau_E, dTe_dt, dni_dt, dIp_dt, P_loss]
-        """
-        try:
-            # Get final state - access the core profiles directly
-            if not state_history or len(state_history) == 0:
-                logger.warning("Empty state history")
-                return np.zeros(11, dtype=np.float32)
-            
-            final_core_profiles = state_history[-1]
-            
-            # Extract core quantities (values at rho=0 or average)
-            # TORAX returns profiles as functions of rho
-            Te_values = final_core_profiles.T_e
-            Ti_values = final_core_profiles.T_i
-            ne_values = final_core_profiles.n_e
-            
-            # Get values - handle both array and function-like objects
-            if hasattr(Te_values, 'values'):
-                Te_core = float(np.mean(Te_values.values))
-            else:
-                Te_core = float(np.mean(Te_values))
-            
-            if hasattr(Ti_values, 'values'):
-                Ti_core = float(np.mean(Ti_values.values))
-            else:
-                Ti_core = float(np.mean(Ti_values))
-            
-            if hasattr(ne_values, 'values'):
-                ne_core = float(np.mean(ne_values.values))
-            else:
-                ne_core = float(np.mean(ne_values))
-            
-            # Current (typical value for ITER)
-            Ip = 8.0  # MA (baseline, would come from simulation)
-            
-            # Derived quantities
-            q95 = 3.0  # Safety factor (typical ITER value)
-            
-            # Beta calculation
-            mu_0 = 4 * np.pi * 1e-7
-            B = self.config.B_0
-            beta_N = (mu_0 / 2) * (ne_core * 1e19 * 1.38e-23 * (Te_core + Ti_core) * 1.602e-16) / (B**2)
-            
-            # Confinement time (ITER89L estimate)
-            tau_E = 0.038 * Ip**0.85 * B**0.3 * (ne_core)**0.1 * 2**0.5 / 20**0.69
-            
-            # Time derivatives (estimate from dynamics)
-            dTe_dt = 0.0  # Placeholder
-            dni_dt = 0.0  # Placeholder
-            dIp_dt = 0.0  # Placeholder
-            
-            # Power loss (rough estimate)
-            Vol = 4 * np.pi**2 * self.config.R_major * self.config.a_minor**2
-            P_loss = (3/2) * ne_core * 1.38e-23 * Te_core * 1.602e-16 * Vol / tau_E / 1e6  # In MW
-            
-            obs = np.array([
-                Te_core,      # [0] Te [keV]
-                Ti_core,      # [1] Ti [keV]
-                ne_core,      # [2] ne [10^19 m^-3]
-                Ip,           # [3] Ip [MA]
-                q95,          # [4] q95
-                beta_N * 100, # [5] beta [%]
-                tau_E,        # [6] tau_E [s]
-                dTe_dt,       # [7] dTe/dt [keV/s]
-                dni_dt,       # [8] dni/dt [10^19/s]
-                dIp_dt,       # [9] dIp/dt [MA/s]
-                P_loss,       # [10] P_loss [MW]
-            ], dtype=np.float32)
-            
-            return obs
-            
-        except Exception as e:
-            logger.error(f"Observation extraction failed: {e}")
-            # Return reasonable defaults instead of zeros
-            return np.array([5.0, 5.0, 1.5, 8.0, 3.0, 2.5, 0.5, 0.0, 0.0, 0.0, 20.0], dtype=np.float32)
-    
-    def _compute_reward(self, obs: np.ndarray, action: np.ndarray) -> float:
-        """
-        Compute multi-objective reward.
-        
-        Objectives:
-        1. Confinement (high tau_E)
-        2. Stability (q95 > 2.5)
-        3. Pressure (high Te, ne)
-        4. Safety (beta < limit)
-        5. Current control (stable Ip)
-        """
-        Te, Ti, ne, Ip, q95, beta_N, tau_E, dTe, dni, dIp, P_loss = obs
-        
-        # Confinement reward (maximize tau_E)
-        r_confinement = min(tau_E / 0.5, 1.0)  # Saturate at 0.5s
-        
-        # Stability reward (q95 > 2.5)
-        r_stability = 1.0 if q95 > 2.5 else max(0.0, q95 / 2.5)
-        
-        # Pressure reward (Te > 5keV, ne > 1.5e19)
-        r_pressure = min((Te / 5.0 + ne / 1.5) / 2.0, 1.0)
-        
-        # Safety reward (beta < limit)
-        r_safety = 1.0 if beta_N < self.config.beta_N_limit else max(0.0, self.config.beta_N_limit / beta_N)
-        
-        # Current stability (minimize |dIp_dt|)
-        r_current = 1.0 / (1.0 + abs(dIp))
-        
-        # Combine objectives
-        reward = (
-            0.25 * r_confinement +
-            0.25 * r_stability +
-            0.20 * r_pressure +
-            0.20 * r_safety +
-            0.10 * r_current
-        )
-        
-        return float(reward)
-    
-    def _get_reward_components(self, obs: np.ndarray, action: np.ndarray) -> Dict[str, float]:
-        """Get individual reward components for analysis."""
-        Te, Ti, ne, Ip, q95, beta_N, tau_E, dTe, dni, dIp, P_loss = obs
-        
-        return {
-            "confinement": min(tau_E / 0.5, 1.0),
-            "stability": 1.0 if q95 > 2.5 else max(0.0, q95 / 2.5),
-            "pressure": min((Te / 5.0 + ne / 1.5) / 2.0, 1.0),
-            "safety": 1.0 if beta_N < self.config.beta_N_limit else max(0.0, self.config.beta_N_limit / beta_N),
-            "current": 1.0 / (1.0 + abs(dIp)),
+        self._last_action = np.zeros(2, dtype=np.float32)
+        self._torax_sim_error = "NONE"
+
+        if self.config.use_torax:
+            try:
+                obs = self._reset_torax_backend()
+                self._torax_runtime_backend = "torax"
+            except Exception as exc:
+                if not self.config.use_mock_fallback:
+                    raise
+                logger.warning("TORAX reset failed (%s); using mock backend", exc)
+                self.config.use_torax = False
+                obs = self._reset_mock_backend()
+                self._torax_runtime_backend = "mock"
+        else:
+            obs = self._reset_mock_backend()
+            self._torax_runtime_backend = "mock"
+
+        self._prev_obs = obs.copy()
+        return obs, {
+            "episode": self.episode_count,
+            "backend": self._torax_runtime_backend,
         }
-    
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        self.step_count += 1
+        action = np.asarray(action, dtype=np.float32)
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self._last_action = action.copy()
+
+        if self.config.use_torax:
+            try:
+                obs = self._step_torax_backend(action)
+                self._torax_runtime_backend = "torax"
+            except Exception as exc:
+                if not self.config.use_mock_fallback:
+                    raise
+                logger.warning("TORAX step failed (%s); using mock backend", exc)
+                self.config.use_torax = False
+                if not self._state:
+                    self._reset_mock_backend()
+                obs = self._step_mock_backend(action)
+                self._torax_runtime_backend = "mock"
+        else:
+            obs = self._step_mock_backend(action)
+            self._torax_runtime_backend = "mock"
+
+        reward = self._compute_reward(obs, action)
+        terminated = self._check_termination(obs)
+        truncated = self.step_count >= self.config.episode_max_steps
+        info = {
+            "step": self.step_count,
+            "backend": self._torax_runtime_backend,
+            "P_heating": float(action[0] * self.config.P_heating_max / 1.0e6),
+            "reward_components": self._get_reward_components(obs, action),
+            "torax_sim_error": self._torax_sim_error,
+        }
+        self._prev_obs = obs.copy()
+        return obs, reward, terminated, truncated, info
+
+    # ---------------------------------------------------------------------
+    # Real TORAX backend
+    # ---------------------------------------------------------------------
+    def _reset_torax_backend(self) -> np.ndarray:
+        self._control_times = [0.0, self.config.fixed_dt]
+        self._heating_schedule = [self.config.P_heating_baseline, self.config.P_heating_baseline]
+        self._ip_schedule = [self.config.I_p_init, self.config.I_p_init]
+        state_history = self._run_torax_schedule(final_time=self.config.fixed_dt)
+        return self._extract_observation_from_torax(state_history)
+
+    def _step_torax_backend(self, action: np.ndarray) -> np.ndarray:
+        current_time = self._control_times[-1]
+        next_time = current_time + self.config.fixed_dt
+
+        heating_power = float(np.clip(action[0], 0.0, 1.0) * self.config.P_heating_max)
+        ramp_command = float(np.clip(action[1], -2.0, 2.0) * self.config.current_ramp_rate_limit)
+        prev_ip = self._ip_schedule[-1]
+        next_ip = float(np.clip(prev_ip + ramp_command * self.config.fixed_dt, self.config.I_p_min, self.config.I_p_max))
+
+        self._control_times.append(next_time)
+        self._heating_schedule.append(heating_power)
+        self._ip_schedule.append(next_ip)
+
+        state_history = self._run_torax_schedule(final_time=next_time)
+        return self._extract_observation_from_torax(state_history)
+
+    def _run_torax_schedule(self, final_time: float) -> StateHistory:
+        torax_config = self._build_torax_config(final_time)
+        _, state_history = run_simulation(
+            torax_config,
+            log_timestep_info=False,
+            progress_bar=False,
+        )
+        self.current_state_history = state_history
+        self._torax_sim_error = str(getattr(state_history, "sim_error", "NONE"))
+        return state_history
+
+    def _build_torax_config(self, final_time: float) -> Any:
+        control_times = self._control_times
+        heat_schedule = {t: p for t, p in zip(control_times, self._heating_schedule)}
+        ip_schedule = {t: p for t, p in zip(control_times, self._ip_schedule)}
+
+        transport_config: Dict[str, Any]
+        if self.config.use_qlknn:
+            transport_config = {"model_name": "qlknn"}
+        else:
+            transport_config = {
+                "model_name": "constant",
+                "chi_i": self.config.chi_i,
+                "chi_e": self.config.chi_e,
+                "D_e": self.config.D_e,
+                "V_e": self.config.V_e,
+            }
+
+        config_dict = {
+            "profile_conditions": {
+                "Ip": ip_schedule,
+                "T_i": {0.0: {0.0: self.config.T_i_core_init, 1.0: 1.0}},
+                "T_i_right_bc": 1.0,
+                "T_e": {0.0: {0.0: self.config.T_e_core_init, 1.0: 1.0}},
+                "T_e_right_bc": 1.0,
+                "n_e": {0.0: {0.0: self.config.n_e_core_init, 1.0: self.config.n_e_edge}},
+                "n_e_right_bc": self.config.n_e_edge,
+                "n_e_right_bc_is_fGW": False,
+                "normalize_n_e_to_nbar": False,
+                "nbar": self.config.n_e_core_init,
+                "n_e_nbar_is_fGW": False,
+            },
+            "numerics": {
+                "t_initial": 0.0,
+                "t_final": final_time,
+                "fixed_dt": self.config.fixed_dt,
+                "max_dt": self.config.max_dt,
+                "adaptive_dt": self.config.adaptive_dt,
+                "evolve_ion_heat": True,
+                "evolve_electron_heat": True,
+                "evolve_current": True,
+                "evolve_density": True,
+            },
+            "plasma_composition": {
+                "main_ion": {"D": 0.5, "T": 0.5},
+                "impurity": "Ne",
+                "Z_eff": self.config.Z_eff,
+            },
+            "geometry": {
+                "geometry_type": "circular",
+                "R_major": self.config.R_major,
+                "a_minor": self.config.a_minor,
+                "B_0": self.config.B_0,
+                "elongation_LCFS": self.config.elongation_lcfs,
+                "n_rho": self.config.n_rho,
+            },
+            "sources": {
+                "generic_heat": {
+                    "P_total": heat_schedule,
+                    "electron_heat_fraction": 0.8,
+                    "gaussian_location": self.config.heating_location,
+                    "gaussian_width": self.config.heating_width,
+                },
+                "generic_current": {
+                    "fraction_of_total_current": self.config.generic_current_fraction,
+                    "gaussian_width": self.config.current_width,
+                    "gaussian_location": self.config.current_location,
+                },
+                "generic_particle": {
+                    "S_total": self.config.particle_source_baseline,
+                    "particle_width": self.config.particle_width,
+                    "deposition_location": self.config.particle_deposition_location,
+                },
+            },
+            "transport": transport_config,
+            "pedestal": {
+                "model_name": "no_pedestal",
+                "set_pedestal": False,
+            },
+            "solver": {
+                "solver_type": "linear",
+                "theta_implicit": self.config.theta_implicit,
+                "use_pereverzev": self.config.use_pereverzev,
+            },
+        }
+        return torax.ToraxConfig(**config_dict)
+
+    def _extract_observation_from_torax(self, state_history: StateHistory) -> np.ndarray:
+        cp = state_history.core_profiles[-1]
+        pp = state_history.post_processed_outputs[-1]
+
+        te = float(np.asarray(pp.T_e_volume_avg))
+        ti = float(np.asarray(pp.T_i_volume_avg))
+        ne = float(np.asarray(pp.n_e_volume_avg) / 1.0e20)
+        ip = float(np.asarray(cp.Ip_profile_face[-1]) / 1.0e6)
+        q95 = float(np.asarray(pp.q95))
+        beta_n = float(np.asarray(pp.beta_N))
+        power_loss_mw = float(np.asarray(pp.P_SOL_total) / 1.0e6)
+        tau_e = float(np.asarray(pp.W_thermal_total) / max(np.asarray(pp.P_SOL_total), 1.0))
+
+        dt = max(self.config.fixed_dt, 1e-6)
+        if np.any(self._prev_obs):
+            dte_dt = (te - float(self._prev_obs[0])) / dt
+            dne_dt = (ne - float(self._prev_obs[2])) / dt
+            dip_dt = (ip - float(self._prev_obs[3])) / dt
+        else:
+            dte_dt = 0.0
+            dne_dt = 0.0
+            dip_dt = 0.0
+
+        return np.array(
+            [te, ti, ne, ip, q95, beta_n, tau_e, dte_dt, dne_dt, dip_dt, power_loss_mw],
+            dtype=np.float32,
+        )
+
+    # ---------------------------------------------------------------------
+    # Mock backend retained for fast dev/tests
+    # ---------------------------------------------------------------------
+    def _reset_mock_backend(self) -> np.ndarray:
+        rng = self.np_random
+        spread = 0.0 if not self.config.scenario_randomization else 1.0
+        self._state = {
+            "Te": float(self.config.T_e_core_init + spread * rng.uniform(-0.8, 0.8)),
+            "Ti": float(self.config.T_i_core_init + spread * rng.uniform(-0.7, 0.7)),
+            "ne": float(self.config.target_n_e + spread * rng.uniform(-0.15, 0.15)),
+            "Ip": float(self.config.I_p_init / 1.0e6 + spread * rng.uniform(-0.4, 0.4)),
+            "dTe_dt": 0.0,
+            "dne_dt": 0.0,
+            "dIp_dt": 0.0,
+            "P_loss": 18.0,
+            "tau_E": 0.55,
+        }
+        return self._build_mock_observation()
+
+    def _step_mock_backend(self, action: np.ndarray) -> np.ndarray:
+        dt = self.config.fixed_dt
+        heating_frac = float(action[0])
+        current_ramp_target = float(action[1])
+
+        te = self._state["Te"]
+        ti = self._state["Ti"]
+        ne = self._state["ne"]
+        ip = self._state["Ip"]
+        d_ip_prev = self._state["dIp_dt"]
+
+        heating_mw = heating_frac * self.config.P_heating_max / 1.0e6
+        current_ramp = d_ip_prev + self.config.actuator_lag * (current_ramp_target - d_ip_prev)
+        ip = np.clip(ip + current_ramp * dt, self.config.I_p_min / 1.0e6, self.config.I_p_max / 1.0e6)
+
+        tau_e = self._compute_tau_E_mock(heating_mw, ip, ne)
+        pressure_index = ne * (te + ti)
+        beta_n = self._compute_beta_N_mock(pressure_index, ip)
+        q95 = self._compute_q95_mock(ip)
+        n_greenwald = self._greenwald_density_mock(ip)
+
+        dte_dt = (
+            0.09 * heating_mw
+            + 0.18 * tau_e
+            - self.config.radiation_loss_coeff * ne * te**1.35
+            - self.config.transport_loss_coeff * max(te - 1.0, 0.0) / max(tau_e, 0.2)
+            - max(0.0, 2.4 - q95) * 0.7
+            - max(0.0, beta_n - self.config.target_beta_N) * 0.45
+            - self.config.temperature_relaxation * (te - self.config.target_T_e)
+        )
+        dti_dt = 0.8 * dte_dt + self.config.bootstrap_coupling * current_ramp
+        dne_dt = (
+            0.012 * heating_mw
+            + 0.02 * max(0.0, 0.75 - ne / max(n_greenwald, 1e-6))
+            - self.config.density_relaxation * (ne - self.config.target_n_e)
+            - 0.015 * max(0.0, ne - 0.82 * n_greenwald)
+        )
+
+        noise_scale = 0.015 if self.config.scenario_randomization else 0.0
+        rng = self.np_random
+        te = np.clip(te + dt * dte_dt + rng.normal(0.0, noise_scale), 0.5, 20.0)
+        ti = np.clip(ti + dt * dti_dt + rng.normal(0.0, noise_scale), 0.5, 20.0)
+        ne = np.clip(ne + dt * dne_dt + rng.normal(0.0, noise_scale * 0.3), 0.2, 4.0)
+        tau_e = self._compute_tau_E_mock(heating_mw, ip, ne)
+        power_loss = self._compute_power_loss_mock(ne, te, ti, tau_e)
+
+        self._state.update(
+            {
+                "Te": float(te),
+                "Ti": float(ti),
+                "ne": float(ne),
+                "Ip": float(ip),
+                "dTe_dt": float(dte_dt),
+                "dne_dt": float(dne_dt),
+                "dIp_dt": float(current_ramp),
+                "P_loss": float(power_loss),
+                "tau_E": float(tau_e),
+                "beta_N": float(self._compute_beta_N_mock(ne * (te + ti), ip)),
+                "q95": float(self._compute_q95_mock(ip)),
+            }
+        )
+        return self._build_mock_observation()
+
+    def _build_mock_observation(self) -> np.ndarray:
+        return np.array(
+            [
+                self._state["Te"],
+                self._state["Ti"],
+                self._state["ne"],
+                self._state["Ip"],
+                self._state.get("q95", self._compute_q95_mock(self._state["Ip"])),
+                self._state.get("beta_N", self._compute_beta_N_mock(self._state["ne"] * (self._state["Te"] + self._state["Ti"]), self._state["Ip"])),
+                self._state["tau_E"],
+                self._state["dTe_dt"],
+                self._state["dne_dt"],
+                self._state["dIp_dt"],
+                self._state["P_loss"],
+            ],
+            dtype=np.float32,
+        )
+
+    def _compute_tau_E_mock(self, heating_mw: float, ip_ma: float, ne_20: float) -> float:
+        return float(np.clip(0.12 * (ip_ma ** 0.85) * (self.config.B_0 ** 0.3) * (max(ne_20, 0.2) ** 0.1) / (max(heating_mw + 5.0, 1.0) ** 0.35), 0.15, 2.5))
+
+    def _compute_q95_mock(self, ip_ma: float) -> float:
+        return float(np.clip(4.5 * (self.config.I_p_init / 1.0e6) / max(ip_ma, 1e-6), 1.3, 8.0))
+
+    def _compute_beta_N_mock(self, pressure_index: float, ip_ma: float) -> float:
+        return float(np.clip(0.12 * pressure_index / max(self.config.B_0, 0.1) * ((self.config.I_p_init / 1.0e6) / max(ip_ma, 1e-6)) ** 0.25, 0.05, 8.0))
+
+    def _greenwald_density_mock(self, ip_ma: float) -> float:
+        return float(ip_ma / (np.pi * self.config.a_minor**2))
+
+    def _compute_power_loss_mock(self, ne_20: float, te_keV: float, ti_keV: float, tau_E: float) -> float:
+        return float(np.clip(ne_20 * (te_keV + ti_keV) * 3.2 / max(tau_E, 0.2), 1.0, 80.0))
+
+    # ---------------------------------------------------------------------
+    # Shared reward / termination logic
+    # ---------------------------------------------------------------------
+    def _tracking_score(self, value: float, target: float, scale: float) -> float:
+        return float(np.exp(-abs(value - target) / max(scale, 1e-6)))
+
+    def _compute_reward(self, obs: np.ndarray, action: np.ndarray) -> float:
+        te, _, ne, _, q95, beta_n, tau_e, _, _, dIp, _ = obs
+        reward = (
+            0.24 * self._tracking_score(float(te), self.config.target_T_e, 1.5)
+            + 0.18 * self._tracking_score(float(ne), self.config.target_n_e, 0.18)
+            + 0.20 * self._tracking_score(float(q95), self.config.target_q95, 0.8)
+            + 0.16 * self._tracking_score(float(beta_n), self.config.target_beta_N, 0.5)
+            + 0.14 * min(float(tau_e) / self.config.target_tau_E, 1.0)
+            + 0.05 * (1.0 / (1.0 + abs(float(dIp))))
+            + 0.03 * (1.0 - 0.15 * float(np.clip(action[0], 0.0, 1.0)))
+        )
+        return float(np.clip(reward, 0.0, 1.0))
+
+    def _get_reward_components(self, obs: np.ndarray, action: np.ndarray) -> Dict[str, float]:
+        te, _, ne, _, q95, beta_n, tau_e, _, _, dIp, _ = obs
+        return {
+            "temperature_tracking": self._tracking_score(float(te), self.config.target_T_e, 1.5),
+            "density_tracking": self._tracking_score(float(ne), self.config.target_n_e, 0.18),
+            "q95_tracking": self._tracking_score(float(q95), self.config.target_q95, 0.8),
+            "beta_tracking": self._tracking_score(float(beta_n), self.config.target_beta_N, 0.5),
+            "confinement": min(float(tau_e) / self.config.target_tau_E, 1.0),
+            "current_smoothness": 1.0 / (1.0 + abs(float(dIp))),
+            "heating_efficiency": 1.0 - 0.15 * float(np.clip(action[0], 0.0, 1.0)),
+        }
+
     def _check_termination(self, obs: np.ndarray) -> bool:
-        """
-        Check if episode should terminate (hard constraint violation).
-        
-        Returns:
-            True if any hard constraint violated
-        """
-        Te, Ti, ne, Ip, q95, beta_N, tau_E, dTe, dni, dIp, P_loss = obs
-        
-        # Quench (T too low)
-        if Te < 1.0:
-            logger.warning(f"Quench: Te={Te:.2f}keV")
-            return True
-        
-        # Disruption (q95 too low)
-        if q95 < 2.0:
-            logger.warning(f"Disruption: q95={q95:.2f}")
-            return True
-        
-        # Density limit (Greenwald)
-        n_GW = Ip / (np.pi * self.config.a_minor**2) * 1e-19  # [10^19]
-        if ne > self.config.n_Greenwald_frac * n_GW:
-            logger.warning(f"Density limit: ne={ne:.2f}e19, n_GW={n_GW:.2f}e19")
-            return True
-        
-        # Beta limit
-        if beta_N > 1.3 * self.config.beta_N_limit:  # Hard limit 30% above nominal
-            logger.warning(f"Beta limit: beta_N={beta_N:.2f}%")
-            return True
-        
-        return False
-    
+        te, _, ne, ip, q95, beta_n, _, _, _, _, _ = obs
+        n_GW = self._greenwald_density_mock(float(ip))
+        torax_error = self._torax_runtime_backend == "torax" and self._torax_sim_error not in {"SimError.NO_ERROR", "NONE"}
+        return bool(
+            te < 1.0
+            or q95 < 2.0
+            or ne > self.config.n_Greenwald_frac * n_GW
+            or beta_n > 1.3 * self.config.beta_N_limit
+            or torax_error
+        )
+
     def render(self) -> None:
-        """Render environment (placeholder for visualization)."""
         if self.render_mode == "human":
-            if self.current_state_history:
-                logger.info(f"Step {self.step_count}: Rendering (not implemented)")
-    
+            logger.info("Step %s | backend=%s | obs=%s", self.step_count, self._torax_runtime_backend, self._prev_obs)
+
     def close(self) -> None:
-        """Clean up resources."""
         logger.info("Environment closed")
 
 
-# Test code
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    
-    print("="*80)
-    print("TORAX RL Environment Test")
-    print("="*80)
-    
-    # Create environment
-    config = ToraxEnvironmentConfig(
-        t_final=5.0,
-        episode_max_steps=10,
-        use_qlknn=True,
-    )
-    
-    env = ToraxRLEnvironment(config, verbose=True)
-    
-    # Reset
-    print("\n1. Resetting environment...")
-    obs, info = env.reset()
-    print(f"   Initial observation shape: {obs.shape}")
-    print(f"   Initial obs: Te={obs[0]:.2f}keV, ne={obs[2]:.2f}e19, q95={obs[4]:.2f}")
-    
-    # Step
-    print("\n2. Taking action steps...")
-    for step in range(3):
-        action = env.action_space.sample()
+    env = ToraxRLEnvironment(ToraxEnvironmentConfig(use_torax=True, use_qlknn=False, episode_max_steps=2), verbose=True)
+    obs, info = env.reset(seed=0)
+    print("Initial observation:", obs)
+    for step in range(2):
+        action = np.array([0.4, 0.0], dtype=np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
-        print(f"   Step {step}: reward={reward:.3f}, terminated={terminated}")
+        print(f"Step {step}: reward={reward:.3f}, terminated={terminated}, truncated={truncated}, backend={info['backend']}")
         if terminated or truncated:
             break
-    
-    env.close()
-    print("\n✓ Test complete")
